@@ -1,0 +1,113 @@
+<?php
+
+declare(strict_types=1);
+
+namespace ShenerCloud\Mqtt\Protocol;
+
+use ShenerCloud\Mqtt\Internals\ClientInterface;
+use ShenerCloud\Mqtt\Internals\PacketIdentifierFunctionality;
+use ShenerCloud\Mqtt\Internals\ProtocolBase;
+use ShenerCloud\Mqtt\Internals\ReadableContent;
+use ShenerCloud\Mqtt\Internals\ReadableContentInterface;
+use ShenerCloud\Mqtt\Internals\WritableContent;
+use ShenerCloud\Mqtt\Internals\WritableContentInterface;
+
+/**
+ * A PUBREL Packet is the response to a PUBREC Packet.
+ *
+ * It is the third packet of the QoS 2 protocol exchange.
+ *
+ * QoS lvl2:
+ *   First packet: PUBLISH
+ *   Second packet: PUBREC
+ *   Third packet: PUBREL
+ *   Fourth packet: PUBCOMP
+ *
+ * @see https://go.gliffy.com/go/publish/12498076
+ */
+final class PubRel extends ProtocolBase implements ReadableContentInterface, WritableContentInterface
+{
+    use ReadableContent, WritableContent, PacketIdentifierFunctionality;
+
+    const CONTROL_PACKET_VALUE = 6;
+
+    /**
+     * @param string $rawMQTTHeaders
+     * @param ClientInterface $client
+     * @return ReadableContentInterface
+     * @throws \OutOfRangeException
+     */
+    public function fillObject(string $rawMQTTHeaders, ClientInterface $client): ReadableContentInterface
+    {
+        $rawHeadersSize = \strlen($rawMQTTHeaders);
+        // A PubRel message is always 4 bytes in size
+        if ($rawHeadersSize !== 4) {
+            $this->logger->debug('Headers are smaller than 4 bytes, retrieving the rest', [
+                'currentSize' => $rawHeadersSize
+            ]);
+            $rawMQTTHeaders .= $client->readBrokerData(4 - $rawHeadersSize);
+        }
+        $this->setPacketIdentifierFromRawHeaders($rawMQTTHeaders);
+        $this->logger->debug('Determined packet identifier', ['PI' => $this->packetIdentifier]);
+
+        return $this;
+    }
+
+    /**
+     * Creates the variable header that each method has
+     * @return string
+     * @throws \OutOfRangeException
+     */
+    public function createVariableHeader(): string
+    {
+        $this->specialFlags |= 2;
+        return $this->getPacketIdentifierBinaryRepresentation();
+    }
+
+    /**
+     * Creates the actual payload to be sent
+     * @return string
+     */
+    public function createPayload(): string
+    {
+        return '';
+    }
+
+    /**
+     * PUBREL should ALWAYS expect an answer back (in the form of a PUBCOMP)
+     * @return bool
+     */
+    public function shouldExpectAnswer(): bool
+    {
+        return true;
+    }
+
+    /**
+     * @param ClientInterface $client
+     * @param WritableContentInterface $originalRequest
+     * @return bool
+     * @throws \LogicException
+     */
+    public function performSpecialActions(ClientInterface $client, WritableContentInterface $originalRequest): bool
+    {
+        if ($originalRequest instanceof PubRec) {
+            $this->controlPacketIdentifiers($originalRequest);
+            $pubComp = new PubComp($this->logger);
+            $pubComp->setPacketIdentifier($this->packetIdentifier);
+            $client->processObject($pubComp);
+
+            return true;
+        }
+
+        $this->logger->warning('Original request NOT a PubRec, ignoring object entirely');
+        return false;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getOriginControlPacket(): int
+    {
+        return PubRec::getControlPacketValue();
+    }
+}

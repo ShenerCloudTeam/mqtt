@@ -1,0 +1,45 @@
+<?php
+
+declare(strict_types=1);
+
+namespace ShenerCloud\Mqtt\Protocol;
+
+use ShenerCloud\Mqtt\Internals\ClientInterface;
+use ShenerCloud\Mqtt\Internals\ProtocolBase;
+use ShenerCloud\Mqtt\Internals\ReadableContent;
+use ShenerCloud\Mqtt\Internals\ReadableContentInterface;
+use ShenerCloud\Mqtt\Internals\WritableContentInterface;
+
+/**
+ * A PINGRESP Packet is sent by the Server to the Client in response to a PINGREQ Packet.
+ *
+ * It indicates that the Server is alive.
+ */
+final class PingResp extends ProtocolBase implements ReadableContentInterface
+{
+    use ReadableContent;
+
+    const CONTROL_PACKET_VALUE = 13;
+
+    /**
+     * @inheritdoc
+     */
+    public function performSpecialActions(ClientInterface $client, WritableContentInterface $originalRequest): bool
+    {
+        $client->updateLastCommunication();
+        return true;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getOriginControlPacket(): int
+    {
+        return PingReq::getControlPacketValue();
+    }
+
+    public function fillObject(string $rawMQTTHeaders, ClientInterface $client): ReadableContentInterface
+    {
+        return $this;
+    }
+}

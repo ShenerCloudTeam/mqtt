@@ -1,0 +1,58 @@
+<?php
+
+declare(strict_types=1);
+
+namespace ShenerCloud\Mqtt\DataTypes;
+
+use ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel;
+
+/**
+ * This Value Object will always contain a valid QoS level.
+ */
+final class QoSLevel
+{
+    /**
+     * This field indicates the level of assurance for delivery of an Application Message. Can be 0, 1 or 2
+     *
+     * 0: At most once delivery (default)
+     * 1: At least once delivery
+     * 2: Exactly once delivery
+     *
+     * @var int
+     */
+    private $qosLevel;
+
+    /**
+     * QoSLevel constructor.
+     *
+     * @param int $qosLevel
+     *
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     */
+    public function __construct(int $qosLevel = 0)
+    {
+        if ($qosLevel > 2 || $qosLevel < 0) {
+            throw new InvalidQoSLevel(sprintf(
+                'The provided QoS level is invalid. Valid values are 0, 1 and 2 (Provided: %d)',
+                $qosLevel
+            ));
+        }
+
+        $this->qosLevel = $qosLevel;
+    }
+
+    /**
+     * Gets the current QoS level
+     *
+     * @return int
+     */
+    public function getQoSLevel(): int
+    {
+        return $this->qosLevel;
+    }
+
+    public function __toString(): string
+    {
+        return (string)$this->qosLevel;
+    }
+}

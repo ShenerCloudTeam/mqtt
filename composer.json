@@ -1,0 +1,27 @@
+{
+	"keywords" : [
+		"laravel",
+		"php",
+		"mqtt"
+	],
+	"autoload" : {
+		"psr-4" : {
+			"ShenerCloud\\Mqtt\\" : "src"
+		}
+	},
+	"name" : "shenercloud/mqtt",
+	"description" : "Complete MQTT v3.1.1 implementation for PHP 7.x",
+	"license" : "GPL-2.0",
+	"require" : {
+		"php" : ">=7.2",
+		"shenercloud/logger" : "^1.0"
+	},
+	"authors" : [{
+			"name" : "ShenerCloud IT",
+			"email" : "shenercloud@163.com",
+			"homepage" : "https://github.com/ShenerCloudTeam/mqtt.git",
+			"role" : "IT"
+		}
+	],
+	"homepage" : "https://github.com/ShenerCloudTeam/mqtt.git"
+}

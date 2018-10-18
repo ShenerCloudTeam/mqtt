@@ -1,0 +1,414 @@
+<?php
+
+declare(strict_types=1);
+
+namespace ShenerCloud\Mqtt\Protocol;
+
+use ShenerCloud\Mqtt\Application\EmptyReadableResponse;
+use ShenerCloud\Mqtt\DataTypes\Message;
+use ShenerCloud\Mqtt\DataTypes\PacketIdentifier;
+use ShenerCloud\Mqtt\DataTypes\QoSLevel;
+use ShenerCloud\Mqtt\DataTypes\TopicName;
+use ShenerCloud\Mqtt\Exceptions\InvalidRequest;
+use ShenerCloud\Mqtt\Internals\ClientInterface;
+use ShenerCloud\Mqtt\Internals\PacketIdentifierFunctionality;
+use ShenerCloud\Mqtt\Internals\ProtocolBase;
+use ShenerCloud\Mqtt\Internals\ReadableContent;
+use ShenerCloud\Mqtt\Internals\ReadableContentInterface;
+use ShenerCloud\Mqtt\Internals\WritableContent;
+use ShenerCloud\Mqtt\Internals\WritableContentInterface;
+use ShenerCloud\Mqtt\Utilities;
+
+/**
+ * A PUBLISH Control Packet is sent from a Client to a Server or vice-versa to transport an Application Message.
+ *
+ * @see http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718037
+ *
+ * QoS lvl1:
+ *   First packet: PUBLISH
+ *   Second packet: PUBACK
+ *
+ * QoS lvl2:
+ *   First packet: PUBLISH
+ *   Second packet: PUBREC
+ *   Third packet: PUBREL
+ *   Fourth packet: PUBCOMP
+ *
+ * @see https://go.gliffy.com/go/publish/12498076
+ */
+final class Publish extends ProtocolBase implements ReadableContentInterface, WritableContentInterface
+{
+    use ReadableContent, WritableContent, PacketIdentifierFunctionality;
+
+    const CONTROL_PACKET_VALUE = 3;
+
+    /**
+     * Contains the message to be sent
+     * @var Message
+     */
+    private $message;
+
+    /**
+     * Flag to check whether a message is a redelivery (DUP flag)
+     * @see http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718038
+     * @var bool
+     */
+    public $isRedelivery = false;
+
+    /**
+     * @return string
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     * @throws \ShenerCloud\Mqtt\Exceptions\MissingTopicName
+     * @throws \OutOfRangeException
+     * @throws \InvalidArgumentException
+     */
+    public function createVariableHeader(): string
+    {
+        if ($this->message === null) {
+            throw new \InvalidArgumentException('You must at least provide a message object with a topic name');
+        }
+
+        $variableHeaderContents = $this->createUTF8String($this->message->getTopicName());
+        // Reset the special flags should the same object be reused with another message
+        $this->specialFlags = 0;
+
+        $variableHeaderContents .= $this->createVariableHeaderFlags();
+
+        return $variableHeaderContents;
+    }
+
+    /**
+     * Sets some common flags and returns the variable header string should there be one
+     *
+     * @return string
+     * @throws \OutOfRangeException
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     */
+    private function createVariableHeaderFlags(): string
+    {
+        if ($this->isRedelivery) {
+            // DUP flag: if the message is a re-delivery, mark it as such
+            $this->specialFlags |= 8;
+            $this->logger->debug('Activating redelivery bit');
+        }
+
+        if ($this->message->isRetained()) {
+            // RETAIN flag: should the server retain the message?
+            $this->specialFlags |= 1;
+            $this->logger->debug('Activating retain flag');
+        }
+
+        // Check QoS level and perform the corresponding actions
+        if ($this->message->getQoSLevel() !== 0) {
+            // 0 for QoS lvl2 for QoS lvl1 and 4 for QoS lvl2
+            $this->specialFlags |= ($this->message->getQoSLevel() * 2);
+            $this->logger->debug(sprintf('Activating QoS level %d bit', $this->message->getQoSLevel()));
+            return $this->getPacketIdentifierBinaryRepresentation();
+        }
+
+        return '';
+    }
+
+    /**
+     * @return string
+     * @throws \ShenerCloud\Mqtt\Exceptions\MissingTopicName
+     * @throws \ShenerCloud\Mqtt\Exceptions\MessageTooBig
+     * @throws \InvalidArgumentException
+     */
+    public function createPayload(): string
+    {
+        if ($this->message === null) {
+            throw new \InvalidArgumentException('A message must be set before publishing');
+        }
+        return $this->message->getPayload();
+    }
+
+    /**
+     * QoS level 0 does not have to wait for a answer, so return false. Any other QoS level returns true
+     * @return bool
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     */
+    public function shouldExpectAnswer(): bool
+    {
+        $shouldExpectAnswer = !($this->message->getQoSLevel() === 0);
+        $this->logger->debug('Checking whether we should expect an answer or not', [
+            'shouldExpectAnswer' => $shouldExpectAnswer,
+        ]);
+        return $shouldExpectAnswer;
+    }
+
+    /**
+     * @param string $brokerBitStream
+     * @param ClientInterface $client
+     * @return ReadableContentInterface
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidResponseType
+     */
+    public function expectAnswer(string $brokerBitStream, ClientInterface $client): ReadableContentInterface
+    {
+        switch ($this->message->getQoSLevel()) {
+            case 1:
+                $pubAck = new PubAck($this->logger);
+                $pubAck->instantiateObject($brokerBitStream, $client);
+                return $pubAck;
+            case 2:
+                $pubRec = new PubRec($this->logger);
+                $pubRec->instantiateObject($brokerBitStream, $client);
+                return $pubRec;
+            case 0:
+            default:
+                return new EmptyReadableResponse($this->logger);
+        }
+    }
+
+    /**
+     * Sets the to be sent message
+     *
+     * @param Message $message
+     * @return WritableContentInterface
+     */
+    public function setMessage(Message $message): WritableContentInterface
+    {
+        $this->message = $message;
+        return $this;
+    }
+
+    /**
+     * Gets the set message
+     *
+     * @return Message
+     */
+    public function getMessage(): Message
+    {
+        return $this->message;
+    }
+
+    /**
+     * Sets several bits and pieces from the first byte of the fixed header for the Publish packet
+     *
+     * @param int $firstByte
+     * @param QoSLevel $qoSLevel
+     * @return Publish
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     */
+    private function analyzeFirstByte(int $firstByte, QoSLevel $qoSLevel): Publish
+    {
+        $this->logger->debug('Analyzing first byte', [sprintf('%08d', decbin($firstByte))]);
+        // Retained bit is bit 0 of first byte
+        $this->message->setRetainFlag(false);
+        if (($firstByte & 1) === 1) {
+            $this->logger->debug('Setting retain flag to true');
+            $this->message->setRetainFlag(true);
+        }
+        // QoS level is already been taken care of, assign it to the message at this point
+        $this->message->setQoSLevel($qoSLevel);
+
+        // Duplicate message must be checked only on QoS > 0, else set it to false
+        $this->isRedelivery = false;
+        if (($firstByte & 8) === 8 && $this->message->getQoSLevel() !== 0) {
+            // Is a duplicate is always bit 3 of first byte
+            $this->isRedelivery = true;
+            $this->logger->debug('Setting redelivery bit');
+        }
+
+        return $this;
+    }
+
+    /**
+     * Finds out the QoS level in a fixed header for the Publish object
+     *
+     * @param int $bitString
+     * @return QoSLevel
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     */
+    private function determineIncomingQoSLevel(int $bitString): QoSLevel
+    {
+        // QoS lvl are in bit positions 1-2. Shifting is strictly speaking not needed, but increases human comprehension
+        $shiftedBits = $bitString >> 1;
+        $incomingQoSLevel = 0;
+        if (($shiftedBits & 1) === 1) {
+            $incomingQoSLevel = 1;
+        }
+        if (($shiftedBits & 2) === 2) {
+            $incomingQoSLevel = 2;
+        }
+
+        $this->logger->debug('Setting QoS level', ['bitString' => $bitString, 'incomingQoSLevel' => $incomingQoSLevel]);
+        return new QoSLevel($incomingQoSLevel);
+    }
+
+    /**
+     * Gets the full message in case this object needs to
+     *
+     * @param string $rawMQTTHeaders
+     * @param ClientInterface $client
+     * @return string
+     * @throws \OutOfBoundsException
+     * @throws \InvalidArgumentException
+     * @throws \ShenerCloud\Mqtt\Exceptions\MessageTooBig
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     */
+    private function completePossibleIncompleteMessage(string $rawMQTTHeaders, ClientInterface $client): string
+    {   
+        if (\strlen($rawMQTTHeaders) === 1) {
+            $this->logger->debug('Only one incoming byte, retrieving rest of size and the full payload');
+            $restOfBytes = $client->readBrokerData(1);
+            if (\ord($restOfBytes) > 127){//需要丢的一个字节
+                for($i=0;$i<=2;$i++){
+                    if ($a = \ord($client->readBrokerData(1)) <= 127)
+                        $i=3;
+                };
+            }
+            $payload = $client->readBrokerData(\ord($restOfBytes));
+        } else {
+            $this->logger->debug('More than 1 byte detected, calculating and retrieving the rest');
+            $restOfBytes = $rawMQTTHeaders{1};
+            $substrnum = 1;
+            if (\ord($restOfBytes) > 127)
+            {
+                for($i=2;$i<=4;$i++){
+                    if (\ord($rawMQTTHeaders{$i}) <= 127)
+                        $i=5;
+                    $substrnum++;
+                };
+            }
+            $payload = substr($rawMQTTHeaders, $substrnum+1);
+            $exactRest = \ord($restOfBytes) - \strlen($payload);
+            $payload .= $client->readBrokerData($exactRest);
+            $rawMQTTHeaders = $rawMQTTHeaders{0};
+        }
+
+        // $rawMQTTHeaders may be redefined
+        return $rawMQTTHeaders . $restOfBytes . $payload;
+    }
+
+    /**
+     * Will perform sanity checks and fill in the Readable object with data
+     * @param string $rawMQTTHeaders
+     * @param ClientInterface $client
+     * @return ReadableContentInterface
+     * @throws \ShenerCloud\Mqtt\Exceptions\MessageTooBig
+     * @throws \OutOfBoundsException
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     * @throws \InvalidArgumentException
+     * @throws \OutOfRangeException
+     */
+    public function fillObject(string $rawMQTTHeaders, ClientInterface $client): ReadableContentInterface
+    {
+        $rawMQTTHeaders = $this->completePossibleIncompleteMessage($rawMQTTHeaders, $client);
+        // Handy to maintain for debugging purposes
+        #$this->logger->debug('Bin data', [\ShenerCloud\Mqtt\DebugTools::convertToBinaryRepresentation($rawMQTTHeaders)]);
+        
+        // TopicFilter size is always the 3rd byte
+        $firstByte = \ord($rawMQTTHeaders{0});
+        $topicSize = \ord($rawMQTTHeaders{3});
+        $qosLevel = $this->determineIncomingQoSLevel($firstByte);
+
+        $messageStartPosition = 4;
+        if ($qosLevel->getQoSLevel() > 0) {
+            $this->logger->debug('QoS level above 0, shifting message start position and getting packet identifier');
+            // [2 (fixed header) + 2 (topic size) + $topicSize] marks the beginning of the 2 packet identifier bytes
+            $this->setPacketIdentifier(new PacketIdentifier(Utilities::convertBinaryStringToNumber(
+                $rawMQTTHeaders{4 + $topicSize} . $rawMQTTHeaders{5 + $topicSize}
+            )));
+            $this->logger->debug('Determined packet identifier', ['PI' => $this->getPacketIdentifier()]);
+            $messageStartPosition += 2;
+        }
+
+        // At this point $rawMQTTHeaders will be always 1 byte long, initialize a Message object with dummy data for now
+        $this->message = new Message(
+            // Save to assume a constant here: first 2 bytes will always be fixed header, next 2 bytes are topic size
+            substr($rawMQTTHeaders, $messageStartPosition + $topicSize),
+            new TopicName(substr($rawMQTTHeaders, 4, $topicSize))
+        );
+        $this->analyzeFirstByte($firstByte, $qosLevel);
+
+        $this->logger->debug('Determined headers', [
+            'topicSize' => $topicSize,
+            'QoSLevel' => $this->message->getQoSLevel(),
+            'isDuplicate' => $this->isRedelivery,
+            'isRetained' => $this->message->isRetained(),
+            #'packetIdentifier' => $this->packetIdentifier->getPacketIdentifierValue(), // This is not always set!
+        ]);
+
+
+        return $this;
+    }
+
+    /**
+     * @inheritdoc
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidRequest
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidQoSLevel
+     * @throws \ShenerCloud\Mqtt\Exceptions\ServerClosedConnection
+     * @throws \ShenerCloud\Mqtt\Exceptions\NotConnected
+     * @throws \ShenerCloud\Mqtt\Exceptions\Connect\NoConnectionParametersDefined
+     */
+    public function performSpecialActions(ClientInterface $client, WritableContentInterface $originalRequest): bool
+    {
+        $qosLevel = $this->message->getQoSLevel();
+        if ($qosLevel === 0) {
+            $this->logger->debug('No response needed', ['qosLevel', $qosLevel]);
+        } else {
+            if ($qosLevel === 1) {
+                $this->logger->debug('Responding with PubAck', ['qosLevel' => $qosLevel]);
+                $client->processObject($this->composePubAckAnswer());
+            } elseif ($qosLevel === 2) {
+                $this->logger->debug('Responding with PubRec', ['qosLevel' => $qosLevel]);
+                $client->processObject($this->composePubRecAnswer());
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Composes a PubRec answer with the same packetIdentifier as what we received
+     *
+     * @return PubRec
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidRequest
+     */
+    private function composePubRecAnswer(): PubRec
+    {
+        $this->checkForValidPacketIdentifier();
+        $pubRec = new PubRec($this->logger);
+        $pubRec->setPacketIdentifier($this->packetIdentifier);
+        return $pubRec;
+    }
+
+    /**
+     * Composes a PubAck answer with the same packetIdentifier as what we received
+     *
+     * @return PubAck
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidRequest
+     */
+    private function composePubAckAnswer(): PubAck
+    {
+        $this->checkForValidPacketIdentifier();
+        $pubAck = new PubAck($this->logger);
+        $pubAck->setPacketIdentifier($this->packetIdentifier);
+        return $pubAck;
+    }
+
+    /**
+     * Will check whether the current object has a packet identifier set. If not, we are in serious problems!
+     *
+     * @return Publish
+     * @throws \ShenerCloud\Mqtt\Exceptions\InvalidRequest
+     */
+    private function checkForValidPacketIdentifier(): self
+    {
+        if ($this->packetIdentifier === null) {
+            $this->logger->critical('No valid packet identifier found at a stage where there MUST be one set');
+            throw new InvalidRequest('You are trying to send a request without a valid packet identifier');
+        }
+
+        return $this;
+    }
+
+    /**
+     * PUBLISH packet is the exception to the rule: it is not started on base of a packet that gets sent by us
+     */
+    public function getOriginControlPacket(): int
+    {
+        return 0;
+    }
+}
